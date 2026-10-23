@@ -108,6 +108,8 @@ jobs:
         echo "---- v2rayN logs"
         find /home/tester/.local/share/v2rayN/guiLogs -type f -exec tail -n 80 {} + 2>/dev/null || true
         cp /tmp/v2rayn-screenshot.png "$GITHUB_WORKSPACE/" 2>/dev/null || true
+        echo "---- SQLite database written by the app"
+        ls -l /home/tester/.local/share/v2rayN/guiConfigs/guiNDB.db || rc=1
         exit "$rc"
 
     - name: Upload screenshot

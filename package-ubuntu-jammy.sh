@@ -3,9 +3,11 @@
 #
 # package-debian.sh only runs on Debian with kernel >= 6.12 and hard-codes Depends
 # (libc6 >= 2.39, bash >= 5.2.21, coreutils >= 9.4, ...) that jammy cannot satisfy,
-# so its .deb does not install on Pop!_OS 22.04. This script keeps the same package
-# layout, builds the checked-out tree, lets dpkg-shlibdeps resolve Depends against
-# the build system and refuses to package binaries that need a newer glibc.
+# so its .deb does not install on Pop!_OS 22.04; the bundled libe_sqlite3.so also
+# needs glibc 2.38, so the app would not start there anyway. This script keeps the
+# same package layout, builds the checked-out tree, rebuilds SQLite for the build
+# system, lets dpkg-shlibdeps resolve Depends against it and refuses to package
+# binaries that need a newer glibc or libstdc++.
 #
 # Run it from a clone with submodules on Ubuntu / Pop!_OS 22.04: ./package-ubuntu-jammy.sh --help
 set -euo pipefail
@@ -104,7 +106,7 @@ install_dependencies() {
 
   $SUDO apt-get update
   $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -y install --no-install-recommends \
-    curl unzip tar rsync ca-certificates git dpkg-dev binutils file desktop-file-utils \
+    curl unzip tar rsync ca-certificates git dpkg-dev binutils file desktop-file-utils gcc libc6-dev \
     libicu-dev libfontconfig1 libfreetype6 libstdc++6 libgcc-s1 zlib1g
 
   if [[ -x "$HOME/.dotnet/dotnet" ]]; then
@@ -148,6 +150,64 @@ publish_binary() {
 
   dotnet publish "$PROJECT" -c Release -r "$RID" -p:PublishSingleFile=false -p:SelfContained=true -o "$pubdir"
   find "$pubdir" -type f -name '*.pdb' -delete
+}
+
+# Repobot.SQLite.Unofficial links libe_sqlite3.so against glibc >= 2.38 (strlcpy,
+# packed relocations), so it does not load on jammy. Rebuild the same SQLite release
+# from the sqlite.org amalgamation with that package's options minus those two.
+rebuild_sqlite() {
+  local lib="$1/libe_sqlite3.so"
+  local pkgver=""
+  local ver=""
+  local code=""
+  local year=""
+  local url=""
+  local tmp=""
+  local major=""
+  local minor=""
+  local patch=""
+
+  [[ -f "$lib" ]] || return 0
+
+  pkgver="$(sed -n 's:.*<PackageVersion Include="Repobot.SQLite.Unofficial" Version="\([^"]*\)".*:\1:p' v2rayN/Directory.Packages.props | head -n1)"
+  if [[ -z "$pkgver" ]]; then
+    echo "[*] Repobot.SQLite.Unofficial is not referenced; keep the bundled libe_sqlite3.so"
+    return 0
+  fi
+
+  ver="$(cut -d. -f1-3 <<<"${pkgver%%-*}")"
+  IFS=. read -r major minor patch <<<"$ver"
+  code="$(printf '%d%02d%02d00' "$major" "$minor" "$patch")"
+
+  tmp="$(mktemp -d)"
+  for year in $(seq "$(date +%Y)" -1 2020); do
+    if curl -fsL "https://www.sqlite.org/${year}/sqlite-amalgamation-${code}.zip" -o "$tmp/sqlite.zip"; then
+      url="https://www.sqlite.org/${year}/sqlite-amalgamation-${code}.zip"
+      break
+    fi
+  done
+  [[ -n "$url" ]] || die "SQLite ${ver} amalgamation not found on sqlite.org"
+
+  echo "[+] Rebuild libe_sqlite3.so (SQLite ${ver}) from $url"
+  unzip -q "$tmp/sqlite.zip" -d "$tmp"
+  gcc -shared -fPIC -s -O2 \
+    -fvisibility=hidden \
+    -DSQLITE_API='__attribute__((visibility("default")))' \
+    -ffunction-sections -fdata-sections \
+    -Wl,--gc-sections \
+    -fno-semantic-interposition \
+    -Wl,-Bsymbolic-functions \
+    -flto=auto \
+    -fno-plt \
+    -DSQLITE_THREADSAFE=1 \
+    -DSQLITE_ENABLE_FTS5 \
+    -DSQLITE_ENABLE_RTREE \
+    -DSQLITE_ENABLE_JSON1 \
+    -DSQLITE_ENABLE_COLUMN_METADATA \
+    -DSQLITE_USE_URI=1 \
+    -o "$lib" \
+    "$tmp"/sqlite-amalgamation-*/sqlite3.c -ldl -lpthread
+  rm -rf "$tmp"
 }
 
 xray_url_for_rid() {
@@ -434,16 +494,35 @@ exit 0
 EOF
 }
 
+# Highest PREFIX_x.y symbol version FILE references or defines. GLIBC_ABI_DT_RELR
+# marks packed relative relocations, which glibc supports since 2.36.
+max_symver() {
+  local prefix="$1"
+  local file="$2"
+
+  objdump -p "$file" 2>/dev/null \
+    | grep -Eo "${prefix}_([0-9]+(\.[0-9]+)+|ABI_DT_RELR)" \
+    | sed "s/^${prefix}_//; s/^ABI_DT_RELR\$/2.36/" \
+    | sort -Vu \
+    | tail -n1 || true
+}
+
+version_gt() {
+  [[ "$1" != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]]
+}
+
 # dpkg-shlibdeps cannot express a glibc newer than the build system's, it only warns,
 # so a binary built against e.g. glibc 2.39 would install fine and then fail to start.
-check_glibc() {
+check_symbol_versions() {
   local root="$1"
-  local host=""
+  local glibc_host=""
+  local cxx_host=""
   local need=""
   local f=""
   local bad=0
 
-  host="$(getconf GNU_LIBC_VERSION | awk '{print $2}')"
+  glibc_host="$(getconf GNU_LIBC_VERSION | awk '{print $2}')"
+  cxx_host="$(max_symver GLIBCXX "$(ldconfig -p | awk '$1 == "libstdc++.so.6" && !p {print $NF; p = 1}')")"
 
   while IFS= read -r -d '' f; do
     case "$(file -b "$f")" in
@@ -451,21 +530,21 @@ check_glibc() {
       *) continue ;;
     esac
 
-    need="$(objdump -T "$f" 2>/dev/null \
-      | grep -Eo 'GLIBC_[0-9]+(\.[0-9]+)+' \
-      | sed 's/^GLIBC_//' \
-      | sort -Vu \
-      | tail -n1 || true)"
-    [[ -n "$need" ]] || continue
+    need="$(max_symver GLIBC "$f")"
+    if [[ -n "$need" ]] && version_gt "$need" "$glibc_host"; then
+      echo "[!] ${f#"$root"/} needs GLIBC_${need}, this system has ${glibc_host}" >&2
+      bad=1
+    fi
 
-    if [[ "$(printf '%s\n%s\n' "$need" "$host" | sort -V | tail -n1)" != "$host" ]]; then
-      echo "[!] ${f#"$root"/} needs GLIBC_${need}, this system has ${host}" >&2
+    need="$(max_symver GLIBCXX "$f")"
+    if [[ -n "$need" && -n "$cxx_host" ]] && version_gt "$need" "$cxx_host"; then
+      echo "[!] ${f#"$root"/} needs GLIBCXX_${need}, this system has ${cxx_host}" >&2
       bad=1
     fi
   done < <(find "$root" -type f -print0)
 
-  [[ "$bad" -eq 0 ]] || die "Some binaries need a newer glibc than ${host}; the package would not start here."
-  echo "[OK] All bundled ELF files run with glibc ${host}"
+  [[ "$bad" -eq 0 ]] || die "Some binaries need newer system libraries than this system has; the package would not start here."
+  echo "[OK] All bundled ELF files run with glibc ${glibc_host} and libstdc++ GLIBCXX_${cxx_host:-?}"
 }
 
 package_binary() {
@@ -509,7 +588,7 @@ package_binary() {
     fi
   done
 
-  check_glibc "$stage/opt/v2rayN"
+  check_symbol_versions "$stage/opt/v2rayN"
 
   multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
   mkdir -p "$WORKDIR/debian"
@@ -588,6 +667,7 @@ main() {
   pubdir="$WORKDIR/publish"
   echo "[*] Publish v2rayN ${VERSION} for ${RID}"
   publish_binary "$pubdir"
+  rebuild_sqlite "$pubdir"
   package_binary "$pubdir"
 }
 
