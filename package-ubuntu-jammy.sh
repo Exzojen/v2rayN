@@ -439,6 +439,12 @@ set -euo pipefail
 DIR="/opt/v2rayN"
 cd "$DIR"
 
+# .NET reports no LocalApplicationData folder until ~/.local/share exists (fresh
+# accounts), and v2rayN then tries to create its data inside the read-only $DIR.
+if [[ -n "${HOME:-}" ]]; then
+  mkdir -p "${XDG_DATA_HOME:-$HOME/.local/share}" 2>/dev/null || true
+fi
+
 if [[ -x "$DIR/v2rayN" ]]; then
   exec "$DIR/v2rayN" "$@"
 fi
