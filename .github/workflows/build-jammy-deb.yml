@@ -1,0 +1,116 @@
+name: release deb for Ubuntu 22.04 / Pop!_OS 22.04
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - popos-22.04
+
+permissions:
+  contents: read
+
+jobs:
+  deb:
+    name: build deb x64 (jammy)
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - name: Prepare tools (Ubuntu 22.04)
+      run: |
+        set -euo pipefail
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates
+
+    - name: Checkout repo
+      uses: actions/checkout@v7
+      with: { submodules: 'recursive', fetch-depth: '0' }
+
+    - name: Package DEB
+      env: { DEB_HOMEPAGE: "https://github.com/${{ github.repository }}" }
+      run: |
+        set -euo pipefail
+        git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        bash ./package-ubuntu-jammy.sh --output "$GITHUB_WORKSPACE/dist"
+
+    - name: Upload DEB artifact
+      uses: actions/upload-artifact@v7
+      with: { name: v2rayN-jammy-deb, path: dist/*.deb, if-no-files-found: error }
+
+  test:
+    name: install and smoke test (jammy)
+    needs: deb
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - name: Download DEB artifact
+      uses: actions/download-artifact@v8
+      with: { name: v2rayN-jammy-deb, path: dist }
+
+    - name: Install with apt
+      run: |
+        set -euo pipefail
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y ./dist/*.deb
+        dpkg -s v2rayn
+
+    - name: Check libraries, cores and desktop entry
+      run: |
+        set -euo pipefail
+        bad=0
+        while IFS= read -r -d '' f; do
+          out="$(ldd "$f" 2>&1 || true)"
+          if grep -q 'not found' <<<"$out"; then
+            echo "== $f"
+            grep 'not found' <<<"$out"
+            bad=1
+          fi
+        done < <(find /opt/v2rayN -type f \( -name '*.so*' -o -perm -111 \) ! -name 'libcoreclrtraceptprovider.so' -print0)
+        [[ "$bad" -eq 0 ]]
+        /opt/v2rayN/bin/xray/xray version
+        /opt/v2rayN/bin/sing_box/sing-box version
+        desktop-file-validate /usr/share/applications/v2rayn.desktop
+
+    - name: GUI smoke test under Xvfb
+      run: |
+        set -euo pipefail
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb xauth dbus imagemagick
+        useradd -m tester
+        cat > /tmp/smoke.sh <<'EOF'
+        #!/usr/bin/env bash
+        set -u
+        v2rayn >/tmp/v2rayn-stdout.log 2>&1 &
+        pid=$!
+        for i in $(seq 1 30); do
+          sleep 1
+          if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid"
+            echo "v2rayN exited after ${i}s with code $?"
+            cat /tmp/v2rayn-stdout.log
+            exit 1
+          fi
+        done
+        import -window root /tmp/v2rayn-screenshot.png || echo "screenshot failed"
+        echo "v2rayN is still running after 30s"
+        cat /tmp/v2rayn-stdout.log
+        kill "$pid"
+        wait "$pid" 2>/dev/null || true
+        EOF
+        chmod 755 /tmp/smoke.sh
+        rc=0
+        runuser -u tester -- env -i HOME=/home/tester PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 \
+          xvfb-run -a -s '-screen 0 1280x800x24' dbus-run-session -- /tmp/smoke.sh || rc=$?
+        echo "---- v2rayN logs"
+        find /home/tester/.local/share/v2rayN/guiLogs -type f -exec tail -n 80 {} + 2>/dev/null || true
+        cp /tmp/v2rayn-screenshot.png "$GITHUB_WORKSPACE/" 2>/dev/null || true
+        exit "$rc"
+
+    - name: Upload screenshot
+      if: always()
+      uses: actions/upload-artifact@v7
+      with: { name: smoke-test-screenshot, path: v2rayn-screenshot.png, if-no-files-found: warn }
